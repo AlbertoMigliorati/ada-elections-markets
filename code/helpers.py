@@ -160,6 +160,11 @@ def load_elections():
     return el.sort_values(["country_name_short", "election_date"])
 
 
+def load_cabinets():
+    """ParlGov view_cabinet as frozen: one row per cabinet and party, all countries and years (no filter)."""
+    return pd.read_csv(raw_file("parlgov_view_cabinet"), parse_dates=["election_date", "start_date"])
+
+
 def candidate_cabinets(cabinets):
     """Cabinets that started without a new election since EVENTS_FROM (ParlGov: same election as the previous cabinet)."""
     cab = cabinets.drop_duplicates("cabinet_id")
@@ -174,5 +179,3 @@ def eligible_from(prices, country, n=MIN_HISTORY):
     """First date with at least n earlier trading days of index history (NaT if the series is too short)."""
     s = prices[TICKERS[country]].dropna()
     return s.index[n] if len(s) > n else pd.NaT
-
-
