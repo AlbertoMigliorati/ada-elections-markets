@@ -66,6 +66,9 @@ ISR_TWO_SESSION_WEEKDAY = 0           # Monday: Israeli return spans two session
 ISR_SUNDAY_TRADING_END = "2025-12-28" # last Sunday-Thursday week of TASE (after the sample)
 # Returns
 STALE_ZERO_RUN = 2                    # run of >= this many consecutive zero returns: repeated closes missing
+# Closes of the frozen file that are not the index (checked against the exchange's daily official lists,
+# before any outcome was looked at): treated as missing, both dates included.
+INVALID_CLOSES = {"GRC": [("2014-12-19", "2015-05-12")]}   # Yahoo GD.AT is another series in this span
 EXTREME_RETURN = 0.15                 # |log return| above this is listed, not removed
 # Global factor
 GLOBAL_ENTRY_HISTORY = 250            # trading days of own history before an index enters the factor
@@ -79,6 +82,7 @@ RESID_DDOF = 3                        # residual sd: alpha, beta0, beta1
 AR_WIN = (-19, 10)                    # days for which AR and SAR are stored (outside EST_WIN)
 NORMAL_EXCL = 10                      # normal day: more than +-10 trading days from any political date
 PRE_VOL_WIN = (-19, -1)               # window of vol_pre, outside EST_WIN
+VOL_DDOF = 1                          # ddof of the sd of AR in vol_pre and of sd_c
 # Outcome
 P_MAIN = 0.95                         # headline threshold quantile
 P_SEC = 0.90                          # single secondary threshold quantile
