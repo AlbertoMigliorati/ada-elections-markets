@@ -2,10 +2,14 @@
 import numpy as np
 import pandas as pd
 
-from helpers import (AR_WIN, DATA, EST_WIN, EVENTS_FROM, GLOBAL_ENTRY_HISTORY, GLOBAL_MAX_STALE_DAYS,
-                     INVALID_CLOSES, ISR_SUNDAY_TRADING_END, ISR_TWO_SESSION_WEEKDAY, LONG_GAP_DAYS, MIN_EST_DAYS, MIN_GLOBAL,
-                     NORMAL_EXCL, OUTCOME_DAYS, OVERLAP_DROP, OVERLAP_FLAG, P_MAIN, P_SEC, POL_EXCL,
-                     PRE_VOL_WIN, RESID_DDOF, SAMPLE_END, STALE_ZERO_RUN, TICKERS, VOL_DDOF, eligible_from)
+from scipy.stats import binom
+
+from helpers import (ALPHA, AR_WIN, B_BOOT, CI_LEVEL, DATA, EST_WIN, EVENTS_FROM, GLOBAL_ENTRY_HISTORY,
+                     GLOBAL_MAX_STALE_DAYS, INVALID_CLOSES, ISR_SUNDAY_TRADING_END, ISR_TWO_SESSION_WEEKDAY,
+                     LONG_GAP_DAYS, MIN_EST_DAYS, MIN_GLOBAL, N_GROUP_PERM, NORMAL_EXCL, OUTCOME_DAYS,
+                     OVERLAP_DROP, OVERLAP_FLAG, P_MAIN, P_SEC, PLACEBO_MIN_PAIRS, PLACEBO_RADIUS,
+                     PLACEBO_RADIUS_WIDE, POL_EXCL, PRE_VOL_WIN, RESID_DDOF, SAMPLE_END, SEED, STALE_ZERO_RUN,
+                     TICKERS, VOL_DDOF, eligible_from)
 
 ANALYSIS_GROUPS = ("election", "crisis", "planned")
 CRISIS_LABELS = {"1": "crisis", "0": "planned"}   # is_crisis / new_is_crisis -> group
@@ -398,3 +402,163 @@ def event_outcomes(events, panels, fits, normal, thr):
     for name in QUANTILES:
         outcomes[f"strong{name[1:]}"] = outcomes[f"strong{name[1:]}"].astype("Int64")
     return outcomes, pd.concat(paths, ignore_index=True), pd.DataFrame(pre_missing)
+
+
+# ----------------------------------------------------------------------------------------------------
+# Matched placebo, tests, bootstrap and placebo paths (05 onwards)
+# ----------------------------------------------------------------------------------------------------
+
+def normal_pairs(normal, thr):
+    """Pairs (d, d+1) of consecutive trading days of a country that are both normal days.
+
+    `normal` is normal_days.csv (every trading day from EVENTS_FROM to SAMPLE_END, so consecutive rows of a
+    country are consecutive trading days). One row per pair: country, date (d), date1 (d+1), day_class (of d)
+    and, for each threshold name of QUANTILES, the flags above_<name>_0 and above_<name>_1: |AR| of d and of
+    d+1 above the threshold of that day's own class.
+    """
+    q = thr.set_index(["country", "day_class"])
+    nd = normal.sort_values(["country", "date"]).reset_index(drop=True)
+    key = pd.MultiIndex.from_frame(nd[["country", "day_class"]])
+    nxt = nd.groupby("country")[["date", "normal"]].shift(-1)
+    out = pd.DataFrame({"country": nd["country"], "date": nd["date"], "date1": nxt["date"],
+                        "day_class": nd["day_class"]})
+    for name in QUANTILES:
+        above = pd.Series(nd["ar"].abs().to_numpy() > q[name].reindex(key).to_numpy())
+        out[f"above_{name}_0"] = above.to_numpy()
+        out[f"above_{name}_1"] = above.groupby(nd["country"]).shift(-1).eq(True).to_numpy()
+    pair = nd["normal"].astype(bool).to_numpy() & nxt["normal"].eq(True).to_numpy()
+    return out[pair].reset_index(drop=True)
+
+
+def placebo_pool(pairs, country, day0, day_class0):
+    """Matched placebo pool of one event: the pairs of its country whose first day d has the day class of
+    day 0 and lies within PLACEBO_RADIUS calendar days of day 0; if that gives fewer than PLACEBO_MIN_PAIRS
+    pairs, the radius is PLACEBO_RADIUS_WIDE (once, never more). Returns (pool, radius)."""
+    cand = pairs[(pairs["country"] == country) & (pairs["day_class"] == day_class0)]
+    dist = (cand["date"] - pd.Timestamp(day0)).abs().dt.days
+    radius = PLACEBO_RADIUS if (dist <= PLACEBO_RADIUS).sum() >= PLACEBO_MIN_PAIRS else PLACEBO_RADIUS_WIDE
+    return cand[dist <= radius], radius
+
+
+def placebo_rate(pool, name, days):
+    """pi: share of the pool's pairs with |AR| above threshold `name` on at least one of `days` (0 = d, 1 = d+1)."""
+    hit = np.zeros(len(pool), dtype=bool)
+    for k in days:
+        hit |= pool[f"above_{name}_{k}"].to_numpy()
+    return hit.mean() if len(pool) else np.nan
+
+
+def event_strong(ev, thr, name, days):
+    """Strong flag of events at threshold `name` over `days`: |AR(k)| above the threshold of day k's own class.
+    ev needs columns country, ar<k> and class<k> for every k in days."""
+    q = thr.set_index(["country", "day_class"])[name]
+    hit = np.zeros(len(ev), dtype=bool)
+    for k in days:
+        qk = q.reindex(pd.MultiIndex.from_arrays([ev["country"], ev[f"class{k}"]])).to_numpy()
+        hit |= ev[f"ar{k}"].abs().to_numpy() > qk
+    return hit.astype(int)
+
+
+def poisson_binomial_pmf(probs):
+    """Exact distribution of a sum of independent Bernoulli(p_i), by convolution."""
+    pmf = np.array([1.0])
+    for p in probs:
+        pmf = np.convolve(pmf, [1.0 - p, p])
+    return pmf
+
+
+def poisson_binomial_upper(k, probs):
+    """P(S >= k) for S a sum of independent Bernoulli(probs)."""
+    return float(poisson_binomial_pmf(probs)[int(k):].sum())
+
+
+def cluster_bootstrap(countries, values, in_a, in_b=None):
+    """Country-cluster bootstrap of mean(values over group a), minus mean(values over group b) if given.
+
+    The countries with at least one event of the tested groups are resampled with replacement, B_BOOT times,
+    with a numpy Generator seeded with SEED. A replicate in which a tested group is empty has no value.
+    Returns (replicates, number of replicates without a value).
+    """
+    countries = np.asarray(countries)
+    in_a = np.asarray(in_a, dtype=bool)
+    in_b = np.zeros(len(in_a), dtype=bool) if in_b is None else np.asarray(in_b, dtype=bool)
+    keep = in_a | in_b
+    ids, inv = np.unique(countries[keep], return_inverse=True)
+    v, a, b = np.asarray(values, dtype=float)[keep], in_a[keep], in_b[keep]
+    sa, na = np.bincount(inv, v * a, len(ids)), np.bincount(inv, a, len(ids))
+    sb, nb = np.bincount(inv, v * b, len(ids)), np.bincount(inv, b, len(ids))
+    rng = np.random.default_rng(SEED)
+    w = rng.multinomial(len(ids), np.full(len(ids), 1 / len(ids)), size=B_BOOT)
+    with np.errstate(invalid="ignore", divide="ignore"):
+        stat = (w @ sa) / (w @ na)
+        if b.any():
+            stat = stat - (w @ sb) / (w @ nb)
+    stat[~np.isfinite(stat)] = np.nan
+    return stat, int(np.isnan(stat).sum())
+
+
+def percentile_interval(replicates):
+    """Percentile interval at CI_LEVEL of the bootstrap replicates (missing replicates left out)."""
+    tail = 100 * (1 - CI_LEVEL) / 2
+    return tuple(np.nanpercentile(replicates, [tail, 100 - tail]))
+
+
+def group_permutation_test(countries, values, is_a):
+    """Two-sided test of mean(values | a) - mean(values | not a), permuting the group label within country.
+
+    N_GROUP_PERM permutations with a numpy Generator seeded with SEED; p = (1 + #{|T*| >= |T|}) / (1 + N).
+    Returns (observed statistic, p-value).
+    """
+    countries = np.asarray(countries)
+    values = np.asarray(values, dtype=float)
+    is_a = np.asarray(is_a, dtype=bool)
+    n_a, n_b = is_a.sum(), (~is_a).sum()
+    observed = values[is_a].mean() - values[~is_a].mean()
+    rng = np.random.default_rng(SEED)
+    labels = np.empty((N_GROUP_PERM, len(values)), dtype=bool)
+    for c in np.unique(countries):
+        idx = np.flatnonzero(countries == c)
+        labels[:, idx] = rng.permuted(np.tile(is_a[idx], (N_GROUP_PERM, 1)), axis=1)
+    perm = labels @ values / n_a - (~labels) @ values / n_b
+    p = (1 + (np.abs(perm) >= np.abs(observed) - 1e-12).sum()) / (1 + N_GROUP_PERM)
+    return observed, p
+
+
+def p1_power(probs, rates):
+    """Power of the one-sided exact test of P1 at ALPHA: critical count k = smallest k with P(S >= k) <= ALPHA
+    under the Poisson-binomial null with probabilities `probs`; power = P(Binomial(N, rate) >= k).
+    Returns a DataFrame with rate, N, critical count, size of the test and power."""
+    pmf = poisson_binomial_pmf(probs)
+    upper = pmf[::-1].cumsum()[::-1]                     # upper[k] = P(S >= k)
+    k = int(np.flatnonzero(upper <= ALPHA)[0])
+    n = len(probs)
+    return pd.DataFrame({"rate": list(rates), "n_events": n, "critical_count": k, "size": upper[k],
+                         "power": [binom.sf(k - 1, n, r) for r in rates]})
+
+
+def sar_paths(panel, fits, positions, rel_days):
+    """SAR paths of the dates at calendar positions `positions`: AR on position + rel_days with the market model
+    fitted on the window placed around that date, divided by that window's residual sd. The same construction
+    as an event's SAR path (rows: dates, columns: rel_days; NaN outside the calendar or where an input is
+    missing)."""
+    pos = np.asarray(positions)[:, None] + np.asarray(rel_days)[None, :]
+    inside = (pos >= 0) & (pos < len(panel))
+    p = np.clip(pos, 0, len(panel) - 1)
+    r, g, gl = (panel[c].to_numpy(dtype=float) for c in ("r", "g", "g_lag"))
+    f = fits.iloc[np.asarray(positions)]
+    ar = r[p] - (f["a"].to_numpy()[:, None] + f["b0"].to_numpy()[:, None] * g[p] + f["b1"].to_numpy()[:, None] * gl[p])
+    ar[~inside] = np.nan
+    return ar / f["s"].to_numpy()[:, None]
+
+
+def draw_placebo_paths(pool_paths, rng):
+    """One placebo path per event: a date drawn at random among the event's pool dates whose path has no
+    missing value (equivalent to redrawing until a complete path is found). `pool_paths` is a list of arrays
+    (pool dates x days), one per event."""
+    out = []
+    for paths in pool_paths:
+        valid = np.flatnonzero(np.isfinite(paths).all(axis=1))
+        if not len(valid):
+            raise ValueError("an event has no placebo date with a complete path")
+        out.append(paths[rng.choice(valid)])
+    return np.vstack(out)
