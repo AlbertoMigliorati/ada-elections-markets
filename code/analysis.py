@@ -6,12 +6,13 @@ from helpers import (AR_WIN, B_BOOT, CI_LEVEL, DATA, EST_WIN, EVENTS_FROM, GLOBA
                      INVALID_CLOSES, ISR_SUNDAY_TRADING_END, ISR_TWO_SESSION_WEEKDAY, LONG_GAP_DAYS, MIN_EST_DAYS,
                      MIN_GLOBAL, N_GROUP_PERM, NORMAL_EXCL, OUTCOME_DAYS, OVERLAP_DROP, P_MAIN, P_SEC,
                      PLACEBO_MIN_PAIRS, PLACEBO_RADIUS, POL_EXCL, PRE_VOL_WIN, PURGE_DAYS, SAMPLE_END, SEED,
-                     STALE_ZERO_RUN, TICKERS, VOL_DDOF)
+                     STALE_ZERO_RUN, TICKERS, VOL_DDOF, load_external, load_prices)
 
 ANALYSIS_GROUPS = ("election", "crisis", "planned")
 CRISIS_LABELS = {"1": "crisis", "0": "planned"}            # is_crisis / new_is_crisis -> group
 QUANTILES = {f"q{P_MAIN * 100:.0f}": P_MAIN, f"q{P_SEC * 100:.0f}": P_SEC}
 FACTORS = ("g", "g_lag", "w", "w_lag")                     # regressors of the market model, besides the constant
+MODELS = {"main": FACTORS, "external": ("w", "w_lag")}     # main model; robustness: external factor only
 
 
 # ----------------------------------------------------------------------------------------------------
@@ -188,6 +189,13 @@ def market_model(panel, factors=FACTORS):
     return out
 
 
+def market_models(political_dates):
+    """Panels from the frozen prices and external series, and the fits of every model in MODELS (dict model ->
+    dict country -> fits). Takes a few seconds, so every notebook recomputes them instead of reading a file."""
+    panels = build_panels(load_prices(), political_dates, load_external()[0])
+    return panels, {m: {c: market_model(p, f) for c, p in panels.items()} for m, f in MODELS.items()}
+
+
 def ar_paths(panel, fits, positions, rel_days):
     """AR on positions + rel_days with the market model fitted around each position (rows: positions; NaN outside
     the calendar or where an input is missing)."""
@@ -229,12 +237,13 @@ def thresholds(normal):
     return pd.DataFrame({"n_normal": q.size(), **{name: q.quantile(p) for name, p in QUANTILES.items()}}).reset_index()
 
 
-def event_outcomes(events, panels, fits, normal, thr):
+def event_outcomes(events, panels, fits, normal, thr=None):
     """Outcomes of every row of the events table. Eligible: eligible in 02, MIN_EST_DAYS estimation days, AR(0) and
-    AR(+1) computable. For eligible rows: AR and SAR on OUTCOME_DAYS, the strong flags (|AR| of a day above the
-    threshold of its class), vol_pre; and the AR/SAR paths on AR_WIN. Returns (outcomes, paths)."""
+    AR(+1) computable. For eligible rows: AR and SAR on OUTCOME_DAYS, vol_pre, the strong flags if thresholds `thr`
+    are given (|AR| of a day above the threshold of its class); and the AR/SAR paths on AR_WIN. Returns (outcomes,
+    paths)."""
     sd_c = normal[normal["normal"]].groupby("country")["ar"].std(ddof=VOL_DDOF)
-    q = thr.set_index(["country", "day_class"])
+    q = thr.set_index(["country", "day_class"]) if thr is not None else None
     rel = np.arange(AR_WIN[0], AR_WIN[1] + 1)
     rows, paths = [], []
     for e in events.itertuples(index=False):
@@ -252,7 +261,7 @@ def event_outcomes(events, panels, fits, normal, thr):
         if not reason:
             row |= {f"{x}{k}": v / (f["s"].iloc[t0] if x == "sar" else 1) for k, v in ar_k.items() for x in ("ar", "sar")}
             row |= {f"strong{name[1:]}": int(any(abs(ar_k[k]) > q.loc[(e.country, p["day_class"].iloc[d]), name]
-                                                 for k, d in zip(OUTCOME_DAYS, days))) for name in QUANTILES}
+                                                 for k, d in zip(OUTCOME_DAYS, days))) for name in QUANTILES if q is not None}
             pre = ar[(rel >= PRE_VOL_WIN[0]) & (rel <= PRE_VOL_WIN[1])]
             row["vol_pre"] = np.log(np.std(pre, ddof=VOL_DDOF) / sd_c[e.country])     # NaN if an AR is missing
             paths.append(pd.DataFrame({"event_id": e.event_id, "variant": e.variant, "rel_day": rel, "ar": ar,

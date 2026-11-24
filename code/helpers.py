@@ -38,7 +38,6 @@ ISR_SUNDAY_TRADING_END = "2025-12-28" # last Sunday-Thursday week of TASE (after
 # Returns
 STALE_ZERO_RUN = 2                    # runs of >= this many zero returns: the repeated closes are removed
 INVALID_CLOSES = {"GRC": [("2014-12-19", "2015-05-12")]}  # not the index (checked against the Athens Exchange lists)
-EXTREME_RETURN = 0.15                 # |log return| above this is listed, not removed
 # Factors of the market model
 GLOBAL_ENTRY_HISTORY = 250            # trading days of own history before an index enters g
 GLOBAL_MAX_STALE_DAYS = 5             # CALENDAR days: max age of a close at the start of a span (g and w)
