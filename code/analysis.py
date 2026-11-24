@@ -1,15 +1,23 @@
 """Functions shared by more than one analysis notebook (03 onwards)."""
+import time
+
 import numpy as np
 import pandas as pd
 
 from scipy.stats import binom
+from sklearn.ensemble import RandomForestClassifier
+from sklearn.linear_model import LogisticRegression
+from sklearn.metrics import brier_score_loss, log_loss, roc_auc_score
+from sklearn.model_selection import GroupKFold
+from sklearn.pipeline import Pipeline
+from sklearn.preprocessing import StandardScaler
 
-from helpers import (ALPHA, AR_WIN, B_BOOT, CI_LEVEL, DATA, EST_WIN, EVENTS_FROM, GLOBAL_ENTRY_HISTORY,
-                     GLOBAL_MAX_STALE_DAYS, INVALID_CLOSES, ISR_SUNDAY_TRADING_END, ISR_TWO_SESSION_WEEKDAY,
-                     LONG_GAP_DAYS, MIN_EST_DAYS, MIN_GLOBAL, N_GROUP_PERM, NORMAL_EXCL, OUTCOME_DAYS,
-                     OVERLAP_DROP, OVERLAP_FLAG, P_MAIN, P_SEC, PLACEBO_MIN_PAIRS, PLACEBO_RADIUS,
-                     PLACEBO_RADIUS_WIDE, POL_EXCL, PRE_VOL_WIN, RESID_DDOF, SAMPLE_END, SEED, STALE_ZERO_RUN,
-                     TICKERS, VOL_DDOF, eligible_from)
+from helpers import (ALPHA, AR_WIN, B_BOOT, C_GRID, CI_LEVEL, DATA, EST_WIN, EVENTS_FROM, GLOBAL_ENTRY_HISTORY,
+                     GLOBAL_MAX_STALE_DAYS, INNER_FOLDS, INVALID_CLOSES, ISR_SUNDAY_TRADING_END,
+                     ISR_TWO_SESSION_WEEKDAY, LONG_GAP_DAYS, MIN_EST_DAYS, MIN_GLOBAL, N_GROUP_PERM, NORMAL_EXCL,
+                     OUTCOME_DAYS, OVERLAP_DROP, OVERLAP_FLAG, P_MAIN, P_SEC, PLACEBO_MIN_PAIRS, PLACEBO_RADIUS,
+                     PLACEBO_RADIUS_WIDE, POL_EXCL, PRE_VOL_WIN, PURGE_DAYS, RESID_DDOF, RF_N_TREES, SAMPLE_END, SEED,
+                     STALE_ZERO_RUN, TICKERS, VOL_DDOF, eligible_from)
 
 ANALYSIS_GROUPS = ("election", "crisis", "planned")
 CRISIS_LABELS = {"1": "crisis", "0": "planned"}   # is_crisis / new_is_crisis -> group
@@ -536,11 +544,10 @@ def p1_power(probs, rates):
                          "power": [binom.sf(k - 1, n, r) for r in rates]})
 
 
-def sar_paths(panel, fits, positions, rel_days):
-    """SAR paths of the dates at calendar positions `positions`: AR on position + rel_days with the market model
-    fitted on the window placed around that date, divided by that window's residual sd. The same construction
-    as an event's SAR path (rows: dates, columns: rel_days; NaN outside the calendar or where an input is
-    missing)."""
+def ar_paths(panel, fits, positions, rel_days):
+    """AR paths of the dates at calendar positions `positions`: AR on position + rel_days with the market model
+    fitted on the window placed around that date. The same construction as an event's AR path (rows: dates,
+    columns: rel_days; NaN outside the calendar or where an input is missing)."""
     pos = np.asarray(positions)[:, None] + np.asarray(rel_days)[None, :]
     inside = (pos >= 0) & (pos < len(panel))
     p = np.clip(pos, 0, len(panel) - 1)
@@ -548,7 +555,21 @@ def sar_paths(panel, fits, positions, rel_days):
     f = fits.iloc[np.asarray(positions)]
     ar = r[p] - (f["a"].to_numpy()[:, None] + f["b0"].to_numpy()[:, None] * g[p] + f["b1"].to_numpy()[:, None] * gl[p])
     ar[~inside] = np.nan
-    return ar / f["s"].to_numpy()[:, None]
+    return ar
+
+
+def sar_paths(panel, fits, positions, rel_days):
+    """SAR paths: ar_paths divided by the residual sd of the window placed around each date."""
+    return ar_paths(panel, fits, positions, rel_days) / fits.iloc[np.asarray(positions)]["s"].to_numpy()[:, None]
+
+
+def pre_volatility(panel, fits, positions, sd_c):
+    """vol_pre of the dates at calendar positions `positions`, built as an event's vol_pre: ln of the sd
+    (ddof VOL_DDOF) of AR over PRE_VOL_WIN, window placed around the date, over the country's normal-day sd
+    sd_c. NaN if an AR of the window is missing."""
+    rel = np.arange(PRE_VOL_WIN[0], PRE_VOL_WIN[1] + 1)
+    ar = ar_paths(panel, fits, positions, rel)
+    return np.log(np.std(ar, axis=1, ddof=VOL_DDOF) / sd_c)
 
 
 def draw_placebo_paths(pool_paths, rng):
@@ -562,3 +583,272 @@ def draw_placebo_paths(pool_paths, rng):
             raise ValueError("an event has no placebo date with a complete path")
         out.append(paths[rng.choice(valid)])
     return np.vstack(out)
+
+
+# ----------------------------------------------------------------------------------------------------
+# Prediction: nested leave-one-country-out validation (06)
+# ----------------------------------------------------------------------------------------------------
+
+MODEL_FEATURES = {"M1": ["vol_pre"],
+                  "M2": ["vol_pre", "crisis"],
+                  "M3": ["vol_pre", "crisis", "enp", "coalition", "minority", "lr_shift_el"]}
+POLITICAL_BLOCK = ["enp", "coalition", "minority", "lr_shift_el"]   # permuted jointly for P3
+
+
+def outer_folds(countries, day0):
+    """Leave-one-country-out folds with the purge: training events whose day 0 is within PURGE_DAYS calendar
+    days of any event of the test country are removed from that fold's training set.
+    Returns a list of dicts: country, train and test (positions), n_purged, min_gap (smallest |day 0 difference|
+    in days between a training and a test event)."""
+    countries = np.asarray(countries)
+    days = pd.to_datetime(pd.Series(day0)).to_numpy().astype("datetime64[D]").astype(np.int64)
+    folds = []
+    for c in np.unique(countries):
+        test = np.flatnonzero(countries == c)
+        other = np.flatnonzero(countries != c)
+        gap = np.abs(days[other][:, None] - days[test][None, :]).min(axis=1)
+        train = other[gap > PURGE_DAYS]
+        folds.append({"country": c, "train": train, "test": test, "n_purged": len(other) - len(train),
+                      "min_gap": int(np.abs(days[train][:, None] - days[test][None, :]).min())})
+    return folds
+
+
+def logistic_model(C, penalty="l2"):
+    """Pipeline(StandardScaler, LogisticRegression): ridge (l2, lbfgs) or lasso (l1, liblinear), no class weights.
+    The penalty is set through l1_ratio (scikit-learn >= 1.8 deprecates the `penalty` argument)."""
+    if penalty == "l2":
+        logit = LogisticRegression(C=C, l1_ratio=0.0, solver="lbfgs", max_iter=10_000, random_state=SEED)
+    elif penalty == "l1":
+        logit = LogisticRegression(C=C, l1_ratio=1.0, solver="liblinear", max_iter=10_000, random_state=SEED)
+    else:
+        raise ValueError(penalty)
+    return Pipeline([("scale", StandardScaler()), ("logit", logit)])
+
+
+def forest_model(min_leaf):
+    """Random forest of method D: RF_N_TREES trees, max_features 'sqrt', random_state SEED."""
+    return RandomForestClassifier(n_estimators=RF_N_TREES, max_features="sqrt", min_samples_leaf=min_leaf,
+                                  random_state=SEED, n_jobs=1)
+
+
+def inner_choice(X, y, groups, make, grid):
+    """Hyperparameter chosen on a training set: GroupKFold(INNER_FOLDS) by country, criterion mean log-loss over
+    the inner folds; on a tie the first value of `grid` wins. Returns (chosen value, mean log-loss per value)."""
+    splits = list(GroupKFold(n_splits=INNER_FOLDS).split(X, y, groups))
+    loss = []
+    for v in grid:
+        fold_loss = [log_loss(y[va], make(v).fit(X[tr], y[tr]).predict_proba(X[va])[:, 1], labels=[0, 1])
+                     for tr, va in splits]
+        loss.append(np.mean(fold_loss))
+    return grid[int(np.argmin(loss))], np.array(loss)
+
+
+def nested_predictions(X, y, groups, folds, kind="l2"):
+    """Out-of-fold probabilities of a strong reaction.
+
+    kind 'M0': the training base rate. kind 'l2' / 'l1': logistic Pipeline, C chosen by inner_choice over
+    C_GRID on the training set of each outer fold, then refitted on that training set. kind 'rf': random forest,
+    min_samples_leaf chosen the same way over `RF_MIN_LEAF_GRID` (passed in as kind ('rf', grid)).
+    Returns (predictions aligned with y, list with one dict per fold: country, chosen value, nonzero coefficients
+    for the logistic models)."""
+    X = np.asarray(X, dtype=float)
+    y = np.asarray(y, dtype=int)
+    groups = np.asarray(groups)
+    pred = np.full(len(y), np.nan)
+    info = []
+    for f in folds:
+        tr, te = f["train"], f["test"]
+        if kind == "M0":
+            pred[te] = y[tr].mean()
+            info.append({"country": f["country"], "value": np.nan})
+            continue
+        if isinstance(kind, tuple):
+            grid, make = kind[1], forest_model
+        else:
+            grid, make = C_GRID, (lambda C, k=kind: logistic_model(C, k))
+        value, _ = inner_choice(X[tr], y[tr], groups[tr], make, grid)
+        m = make(value).fit(X[tr], y[tr])
+        pred[te] = m.predict_proba(X[te])[:, 1]
+        row = {"country": f["country"], "value": value}
+        if not isinstance(kind, tuple):
+            scaler = m.named_steps["scale"]
+            sd = X[tr].std(axis=0)
+            if not (np.allclose(scaler.mean_, X[tr].mean(axis=0)) and np.allclose(scaler.scale_, np.where(sd == 0, 1, sd))):
+                raise AssertionError("scaler not fitted on the training set of the fold")
+            row["nonzero"] = m.named_steps["logit"].coef_[0] != 0
+        info.append(row)
+    return pred, info
+
+
+def permute_block(block, cells, rng):
+    """Rows of `block` permuted jointly within each cell (the whole row moves), cells in sorted order."""
+    out = block.copy()
+    for cell in np.unique(cells):
+        idx = np.flatnonzero(cells == cell)
+        out[idx] = block[idx[rng.permutation(len(idx))]]
+    return out
+
+
+def event_losses(y, p):
+    """Per-event log-loss and squared error (Brier) of probabilities p. For the log-loss p is clipped to
+    [eps, 1 - eps] (float eps), as scikit-learn's log_loss does; it matters only for the random forest."""
+    y = np.asarray(y, dtype=float)
+    p = np.asarray(p, dtype=float)
+    pc = np.clip(p, np.finfo(float).eps, 1 - np.finfo(float).eps)
+    return -(y * np.log(pc) + (1 - y) * np.log(1 - pc)), (p - y) ** 2
+
+
+def point_metrics(y, p):
+    """Pooled log-loss, AUC and Brier score of out-of-fold predictions (scikit-learn)."""
+    return {"logloss": log_loss(y, p, labels=[0, 1]), "auc": roc_auc_score(y, p), "brier": brier_score_loss(y, p)}
+
+
+def bootstrap_metrics(countries, y, preds, deltas):
+    """Country-cluster bootstrap of the pooled out-of-fold metrics, without refitting.
+
+    Countries are resampled with replacement B_BOOT times (numpy Generator seeded with SEED; the same draws as
+    cluster_bootstrap): each event is weighted by the number of times its country is drawn. For every model in
+    `preds` (dict name -> probabilities): weighted log-loss, Brier and AUC (Mann-Whitney with weights; ties
+    count one half); for every pair (a, b) in `deltas`: log-loss(a) - log-loss(b) on the same draws. A replicate
+    without a positive or without a negative has no AUC. Returns dict (name, metric) -> replicates.
+    """
+    countries = np.asarray(countries)
+    y = np.asarray(y, dtype=int)
+    ids, inv = np.unique(countries, return_inverse=True)
+    rng = np.random.default_rng(SEED)
+    w = rng.multinomial(len(ids), np.full(len(ids), 1 / len(ids)), size=B_BOOT)[:, inv].astype(float)
+    wsum = w.sum(axis=1)
+    pos, neg = y == 1, y == 0
+    out = {}
+    for name, p in preds.items():
+        ll, sq = event_losses(y, p)
+        out[(name, "logloss")] = w @ ll / wsum
+        out[(name, "brier")] = w @ sq / wsum
+        p = np.asarray(p, dtype=float)
+        k = (p[pos][:, None] > p[neg][None, :]) + 0.5 * (p[pos][:, None] == p[neg][None, :])
+        with np.errstate(invalid="ignore", divide="ignore"):
+            auc = np.einsum("bi,ij,bj->b", w[:, pos], k, w[:, neg]) / (w[:, pos].sum(axis=1) * w[:, neg].sum(axis=1))
+        auc[~np.isfinite(auc)] = np.nan
+        out[(name, "auc")] = auc
+    for a, b in deltas:
+        out[(f"{a}-{b}", "delta_logloss")] = out[(a, "logloss")] - out[(b, "logloss")]
+    return out
+
+
+# Specifications of 06: samples, folds, model fits and the P3 permutation test
+
+STRONG = {q: "strong" + q[1:] for q in QUANTILES}   # outcome column of each threshold: strong95, strong90
+
+
+def prediction_sample(events, outcomes, set_name):
+    """Eligible elections and crises of one set after the overlap rule (planned changes left out), with the
+    outcomes and vol_pre of 04."""
+    t = apply_robustness_set(events, set_name, outcomes)
+    t = t[t["eligible"] & ~t["overlap_drop"] & t["group"].isin(["crisis", "election"])]
+    t = t.merge(outcomes[["event_id", "variant", *STRONG.values(), "vol_pre"]], on=["event_id", "variant"],
+                validate="one_to_one")
+    return t.reset_index(drop=True)
+
+
+def prediction_specs(sets):
+    """(variant, set, outcome column, with Israel) of the main specification and of the secondary ones:
+    S2 threshold P_SEC, S4 without Israel, S5 every robustness set."""
+    y_main, y_sec = STRONG["q95"], STRONG["q90"]
+    return ([("main", "main", y_main, True), ("q90", "main", y_sec, True), ("no_israel", "main", y_main, False)]
+            + [("main", s, y_main, True) for s in sets if s != "main"])
+
+
+def prepare_spec(sample, ycol, israel, verbose=False):
+    """Arrays and outer folds of one specification; checks the folds and prints positives per fold."""
+    t = sample if israel else sample[sample["country"] != "ISR"].reset_index(drop=True)
+    d = {"t": t, "y": t[ycol].astype(int).to_numpy(), "countries": t["country"].to_numpy(),
+         "cells": (t["country"] + "|" + t["group"]).to_numpy(),
+         "X": {m: t[f].to_numpy(dtype=float) for m, f in MODEL_FEATURES.items()}}
+    d["folds"] = outer_folds(d["countries"], t["day0"])
+    check_folds(d, verbose)
+    return d
+
+
+def check_folds(d, verbose=False):
+    """No test-country event in training; after the purge every training event is more than PURGE_DAYS calendar
+    days from every test event. Prints positives per fold (all of them if verbose) and the folds with none."""
+    days = pd.to_datetime(d["t"]["day0"]).to_numpy()
+    for f in d["folds"]:
+        tr, te = f["train"], f["test"]
+        assert not np.isin(d["countries"][tr], d["countries"][te]).any(), "test-country event in training"
+        gap = np.abs((days[tr][:, None] - days[te][None, :]) / np.timedelta64(1, "D")).min()
+        assert gap > PURGE_DAYS and f["min_gap"] > PURGE_DAYS, f["country"]
+        assert len(np.intersect1d(tr, te)) == 0
+    pos = pd.DataFrame({"country": [f["country"] for f in d["folds"]],
+                        "test_events": [len(f["test"]) for f in d["folds"]],
+                        "test_positives": [int(d["y"][f["test"]].sum()) for f in d["folds"]],
+                        "train_events": [len(f["train"]) for f in d["folds"]],
+                        "train_positives": [int(d["y"][f["train"]].sum()) for f in d["folds"]],
+                        "purged": [f["n_purged"] for f in d["folds"]]})
+    if verbose:
+        print(pos.to_string(index=False))
+    zero = pos.loc[pos["test_positives"] == 0, "country"].tolist()
+    print(f"{len(d['folds'])} folds, {int(d['y'].sum())} positives of {len(d['y'])}; folds with zero positives "
+          f"in the test country ({len(zero)}, still scored in the pooled metrics): {zero}")
+
+
+def fit_models(d, models=("M0", "M1", "M2", "M3")):
+    """Out-of-fold predictions of the models (M0: training base rate; M1-M3: nested ridge), the C chosen in each
+    fold and the time of each nested run (d['seconds_M3'] is the work repeated by each permutation of P3)."""
+    preds, chosen = {}, {}
+    for m in models:
+        start = time.perf_counter()
+        if m == "M0":
+            preds[m], _ = nested_predictions(d["X"]["M1"], d["y"], d["countries"], d["folds"], "M0")
+        else:
+            preds[m], info = nested_predictions(d["X"][m], d["y"], d["countries"], d["folds"], "l2")
+            chosen[m] = [i["value"] for i in info]
+        d[f"seconds_{m}"] = time.perf_counter() - start
+    for m, p in preds.items():
+        assert np.isfinite(p).all() and ((p > 0) & (p < 1)).all(), f"{m}: prediction outside (0, 1)"
+    if "M0" in preds:
+        check_m0(d, preds["M0"])
+    d["preds"], d["chosen"] = preds, chosen
+    return d
+
+
+def check_m0(d, p0):
+    """In each fold M0 predicts the training base rate b_k, so its pooled log-loss is exactly the entropy of the
+    overall base rate plus, for every test country, the extra loss of predicting b_k instead of the overall rate.
+    That extra loss is large when strong reactions are concentrated in a few countries; it is printed."""
+    y, base = d["y"], d["y"].mean()
+    entropy = -(base * np.log(base) + (1 - base) * np.log(1 - base))
+    extra = {}
+    for f in d["folds"]:
+        b, yt = y[f["train"]].mean(), y[f["test"]]
+        assert (p0[f["test"]] == b).all(), f"M0 is not the training base rate in fold {f['country']}"
+        extra[f["country"]] = (event_losses(yt, np.full(len(yt), b))[0].sum()
+                               - event_losses(yt, np.full(len(yt), base))[0].sum()) / len(y)
+    m0 = point_metrics(y, p0)["logloss"]
+    assert abs(m0 - entropy - sum(extra.values())) < 1e-12, (m0, entropy, sum(extra.values()))
+    top = pd.Series(extra).sort_values(ascending=False).head(3).round(4).to_dict()
+    print(f"M0 log-loss {m0:.4f} = base-rate entropy {entropy:.4f} + {m0 - entropy:.4f} from differences in the "
+          f"training base rate across folds (largest: {top})")
+
+
+def p3_test(d, n_perm):
+    """P3 on one specification: observed Δ = log-loss(M1) - log-loss(M3), and its null from n_perm permutations of
+    the political block within country x group cells (numpy Generator seeded with SEED; outcome, vol_pre and
+    crisis kept; M1 does not use the block, so its predictions are the same in every permutation and are not
+    recomputed). One-sided p = (1 + #{Δ* >= Δ}) / (n_perm + 1). Adds delta, null, p3 and n_perm to d."""
+    y = d["y"]
+    observed = point_metrics(y, d["preds"]["M1"])["logloss"] - point_metrics(y, d["preds"]["M3"])["logloss"]
+    rng = np.random.default_rng(SEED)
+    cols = [MODEL_FEATURES["M3"].index(f) for f in POLITICAL_BLOCK]
+    ll1 = event_losses(y, d["preds"]["M1"])[0].mean()
+    null = np.empty(n_perm)
+    start = time.perf_counter()
+    for i in range(n_perm):
+        X = d["X"]["M3"].copy()
+        X[:, cols] = permute_block(X[:, cols], d["cells"], rng)
+        p3, _ = nested_predictions(X, y, d["countries"], d["folds"], "l2")
+        null[i] = ll1 - event_losses(y, p3)[0].mean()
+        if (i + 1) % 100 == 0:
+            print(f"  {i + 1}/{n_perm} permutations, {(time.perf_counter() - start) / 60:.1f} min")
+    d.update(delta=observed, null=null, p3=(1 + (null >= observed - 1e-12).sum()) / (n_perm + 1), n_perm=n_perm)
+    return d
