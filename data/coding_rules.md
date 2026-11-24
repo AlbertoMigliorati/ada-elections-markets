@@ -43,6 +43,9 @@ A row may deviate from the default only by an explicit decision of the author.
   - Anonymous-source reports, analyst assessments and "set to" or "looks like" headlines are not triggers. If seen, they go in `alt_trigger_dates`.
   - A statement by an actor who does not decide the outcome (e.g. the PM's prognosis about a vote others will cast) is not a trigger.
   - Do not search backwards for earlier hints.
+  - An actor who decides the outcome is the head of government, the party body that elects or removes the head of government (party room, caucus, directorate), or a partner or support party whose exit removes the majority. Ministers who resign, challengers, and parties whose abstention leaves the majority intact do not decide it (GBR_1676, AUS_1585, ITA_1681).
+  - A resignation for health reasons without incapacity follows Rule A2, not the incapacitated-PM rule (JPN_1644).
+  - A head of government's on-record commitment to set a timetable for his or her exit is a trigger (GBR_1599).
 - **Rule A3 (conditional threats).** A conditional threat or ultimatum ("X unless Y") is not a trigger; it goes in `alt_trigger_dates`. The trigger is the first unconditional on-record act or statement that commits the actor to the outcome.
 - **Incapacitated PM.** The trigger is the first day a major outlet reports the hospitalisation; `health_related` = 1. If the coded change is something else and the incapacity is only a confounder, `health_related` stays 0 and the incapacity date goes in alt (ISR_1129).
 - **Bundled ParlGov steps.** If one ParlGov step spans several events, code on the cabinet's own dated change. Earlier unplanned events go in `alt_trigger_dates`. If the earlier events are dated on opened pages, the row may enter R_bundle (EST_1688, ISR_1128). ISR_1122 stays out because its earlier exits were seen only in search results.
